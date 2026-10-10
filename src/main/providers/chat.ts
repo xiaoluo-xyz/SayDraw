@@ -1,7 +1,7 @@
 // OpenAI 兼容 /chat/completions:SSE 流式 + vision + tool calls
 
 import type { ChatProfile } from '@shared/types'
-import { ApiError, endpointUrl, gatewaySessionHeaders, readErrorMessage, sseDataChunks, withTimeout } from './http'
+import { ApiError, createIdleGuard, endpointUrl, gatewaySessionHeaders, readErrorMessage, sseDataChunks, withTimeout } from './http'
 
 // ---------- LLM 消息结构 ----------
 
@@ -70,6 +70,8 @@ export async function chatCompletionStream(opts: {
   if (profile.reasoningEffort) body.reasoning_effort = profile.reasoningEffort
   if (tools?.length) body.tools = tools
 
+  // 空闲超时:timeoutMs 内没有数据才中断(长回答不再被整请求 deadline 误杀)
+  const guard = createIdleGuard(signal, timeoutMs)
   const res = await fetch(endpointUrl(profile.baseUrl, profile.chatPath, 'chat/completions'), {
     method: 'POST',
     headers: {
@@ -78,7 +80,7 @@ export async function chatCompletionStream(opts: {
       ...gatewaySessionHeaders(profile.baseUrl, opts.sessionKey ?? 'default')
     },
     body: JSON.stringify(body),
-    signal: withTimeout(signal, timeoutMs)
+    signal: guard.signal
   })
   if (!res.ok) await readErrorMessage(res)
 
@@ -86,7 +88,7 @@ export async function chatCompletionStream(opts: {
   let finishReason: string | null = null
   const acc = new Map<number, ToolCallAcc>()
 
-  for await (const data of sseDataChunks(res)) {
+  for await (const data of sseDataChunks(res, guard.touch)) {
     if (data === '[DONE]') break
     let json: {
       choices?: {
@@ -141,6 +143,7 @@ export async function chatCompletionStream(opts: {
     toolCalls.push({ id: slot.id || `call_${Math.random().toString(36).slice(2, 10)}`, name: slot.name, args })
   }
 
+  guard.dispose()
   return { content, toolCalls, finishReason }
 }
 

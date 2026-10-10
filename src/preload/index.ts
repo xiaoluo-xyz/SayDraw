@@ -21,6 +21,11 @@ const api = {
     return () => ipcRenderer.removeListener(IPC.EVENT, listener)
   },
 
+  app: {
+    /** 应用版本号(侧栏展示;别再写死,免得界面版本和实际构建对不上) */
+    version: (): Promise<string> => ipcRenderer.invoke(IPC.APP_INFO)
+  },
+
   sessions: {
     list: (): Promise<SessionSummary[]> => ipcRenderer.invoke(IPC.SESSIONS_LIST),
     create: (title?: string): Promise<SessionSummary> => ipcRenderer.invoke(IPC.SESSIONS_CREATE, title),

@@ -24,6 +24,43 @@ function readBody(req) {
   })
 }
 
+/** 原样读请求体(按 utf8 增量解码,避免多字节中文被切在半路) */
+function readRawBody(req) {
+  return new Promise((resolve) => {
+    let data = ''
+    req.setEncoding('utf8')
+    req.on('data', (c) => (data += c))
+    req.on('end', () => resolve(data))
+  })
+}
+
+// ---------- 观测与故障注入(供 scripts/verify-fix.cjs 这类校验脚本使用) ----------
+// GET  /__stats   → 最近/最大请求体体积、请求里的内联图片张数等(验证"请求体不再被大图撑爆")
+// POST /__mode    → { fail: true } 让后续对话请求返回 500(验证失败时消息仍落盘并带原因)
+// POST /__reset   → 清空统计
+const stats = {
+  requests: 0,
+  maxBodyBytes: 0,
+  lastBodyBytes: 0,
+  lastUrl: '',
+  lastImageCount: 0,
+  lastHadOmitNote: false,
+  failChat: false,
+  /** 每个 SSE 分片之间的间隔(ms):用来验证"持续输出不超时 / 静默才超时" */
+  streamDelayMs: 15
+}
+
+/** 统计请求体里内联图片张数与"体积超预算被省略"的留痕 */
+function observeBody(url, rawBody) {
+  const imageCount = (rawBody.match(/data:image\//g) ?? []).length
+  stats.requests += 1
+  stats.lastUrl = url
+  stats.lastBodyBytes = Buffer.byteLength(rawBody, 'utf8')
+  stats.lastImageCount = imageCount
+  stats.lastHadOmitNote = rawBody.includes('未随本次请求发送')
+  if (stats.lastBodyBytes > stats.maxBodyBytes) stats.maxBodyBytes = stats.lastBodyBytes
+}
+
 // ---------- OpenAI 规范决策 ----------
 
 function decideOpenAi(body) {
@@ -35,6 +72,20 @@ function decideOpenAi(body) {
   const confirmed = joined.includes('已确认(用户已同意按此规格生成)')
   const toolMsgs = msgs.filter((m) => m.role === 'tool')
   const lastTool = toolMsgs.length ? String(toolMsgs[toolMsgs.length - 1].content) : ''
+
+  // 脚本化导入指令:用户消息里带 `__IMPORT__ 路径1|路径2|…` 时,逐个调用 import_image
+  // (校验"导入大图后请求体是否被撑爆"这条真实链路:scripts/verify-fix.cjs)
+  const directive = joined.match(/__IMPORT__\s+([^\n"]+)/)
+  if (directive) {
+    const paths = directive[1]
+      .split('|')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    const imported = toolMsgs.filter((m) => String(m.content).startsWith('已导入图片')).length
+    if (imported < paths.length) {
+      return { kind: 'tool', name: 'import_image', args: { path: paths[imported] } }
+    }
+  }
 
   if (!toolMsgs.length) {
     // 第一轮:未确认时故意违规直接生成(测需求确认门);已确认则正常生成
@@ -88,7 +139,7 @@ function sse(res, chunks, doneMarker) {
   const tick = () => {
     if (i < chunks.length) {
       res.write(`data: ${JSON.stringify(chunks[i++])}\n\n`)
-      setTimeout(tick, 15)
+      setTimeout(tick, stats.streamDelayMs)
     } else {
       res.write('data: [DONE]\n\n')
       res.end()
@@ -195,12 +246,35 @@ function responsesStream(req, res, body) {
 const server = http.createServer(async (req, res) => {
   const url = req.url ?? ''
   try {
-    if (req.method === 'POST' && url.endsWith('/responses')) {
-      responsesStream(req, res, await readBody(req))
+    if (req.method === 'GET' && url === '/__stats') {
+      json(res, stats)
+    } else if (req.method === 'POST' && url === '/__mode') {
+      const body = await readBody(req)
+      if (typeof body.fail === 'boolean') stats.failChat = body.fail
+      if (typeof body.streamDelayMs === 'number') stats.streamDelayMs = Math.max(0, body.streamDelayMs)
+      json(res, stats)
+    } else if (req.method === 'POST' && url === '/__reset') {
+      stats.requests = 0
+      stats.maxBodyBytes = 0
+      stats.lastBodyBytes = 0
+      stats.lastImageCount = 0
+      stats.lastHadOmitNote = false
+      json(res, stats)
+    } else if (req.method === 'POST' && url.endsWith('/responses')) {
+      const raw = await readRawBody(req)
+      observeBody(url, raw)
+      if (stats.failChat) return json(res, { error: { message: 'mock 500:上游网关超时' } }, 500)
+      responsesStream(req, res, raw ? JSON.parse(raw) : {})
     } else if (req.method === 'POST' && url.endsWith('/chat/completions')) {
-      openaiChatStream(req, res, await readBody(req))
+      const raw = await readRawBody(req)
+      observeBody(url, raw)
+      if (stats.failChat) return json(res, { error: { message: 'mock 500:上游网关超时' } }, 500)
+      openaiChatStream(req, res, raw ? JSON.parse(raw) : {})
     } else if (req.method === 'POST' && url.endsWith('/messages')) {
-      anthropicStream(req, res, await readBody(req))
+      const raw = await readRawBody(req)
+      observeBody(url, raw)
+      if (stats.failChat) return json(res, { error: { message: 'mock 500:上游网关超时' } }, 500)
+      anthropicStream(req, res, raw ? JSON.parse(raw) : {})
     } else if (req.method === 'POST' && url.endsWith('/images/generations')) {
       json(res, { data: [{ b64_json: TINY_PNG }] })
     } else if (req.method === 'POST' && url.endsWith('/images/edits')) {

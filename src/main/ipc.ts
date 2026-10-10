@@ -1,6 +1,6 @@
 // IPC 处理器注册:invoke 通道 + agent 事件推送
 
-import { BrowserWindow, ClipboardItem, Menu, clipboard, dialog, ipcMain, nativeImage } from 'electron'
+import { BrowserWindow, ClipboardItem, Menu, app, clipboard, dialog, ipcMain, nativeImage } from 'electron'
 import type { IpcMainInvokeEvent } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { IPC } from '@shared/ipc'
@@ -43,6 +43,10 @@ function emit(event: AgentEvent): void {
 export function registerIpc(): void {
   const db = getDb()
   const settings = getSettings()
+
+  // ---------- 应用元信息 ----------
+
+  ipcMain.handle(IPC.APP_INFO, () => app.getVersion())
 
   // ---------- 会话 ----------
 

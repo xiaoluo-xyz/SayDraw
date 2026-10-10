@@ -50,9 +50,50 @@ export function endpointUrl(baseUrl: string, explicitPath: string | undefined, r
   return /\/v\d+$/.test(base) ? `${base}/${rel}` : `${base}/v1/${rel}`
 }
 
-/** 合并外部取消信号与超时 */
+/** 合并外部取消信号与超时(整请求硬上限;用于 ping/生图/列模型这类短请求) */
 export function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
   return AbortSignal.any([signal ?? new AbortController().signal, AbortSignal.timeout(timeoutMs)])
+}
+
+/** 流式对话请求的总上限:兜住"服务端一直滴数据但永不结束"的极端情况(正常由空闲超时兜底) */
+export const STREAM_HARD_TIMEOUT_MS = 15 * 60_000
+
+export interface IdleGuard {
+  /** 交给 fetch 的信号:外部取消、空闲超时、总超时任一触发都会中断 */
+  signal: AbortSignal
+  /** 收到任何数据(含心跳/思考增量)时调用,重新计时 */
+  touch: () => void
+  /** 请求结束(含失败)后清计时器;忘了调用也只是让计时器多待一会儿,不影响已结束的请求 */
+  dispose: () => void
+}
+
+/**
+ * 流式请求的空闲超时守卫:只要还在收数据就不算超时,连续 idleMs 没有任何数据才中断。
+ *
+ * 为什么不用 `AbortSignal.timeout` 直接卡整请求:deepseek-v4.1-flash(max 推理强度、
+ * maxOutputTokens 6.4 万)这类配置,单轮流式输出几分钟很常见 —— 2026-10-10 实测,
+ * 一个完全正常的回合在 120 秒处被硬 deadline 掐断,界面只显示「请求超时」。
+ */
+export function createIdleGuard(external: AbortSignal | undefined, idleMs: number, hardMs = STREAM_HARD_TIMEOUT_MS): IdleGuard {
+  const ctrl = new AbortController()
+  let idleTimer: NodeJS.Timeout | null = null
+  const arm = (): void => {
+    if (idleTimer) clearTimeout(idleTimer)
+    idleTimer = setTimeout(() => ctrl.abort(new DOMException(`idle ${idleMs}ms`, 'TimeoutError')), idleMs)
+    idleTimer.unref?.()
+  }
+  arm()
+  const hardTimer = setTimeout(() => ctrl.abort(new DOMException(`hard ${hardMs}ms`, 'TimeoutError')), hardMs)
+  hardTimer.unref?.()
+
+  return {
+    signal: external ? AbortSignal.any([external, ctrl.signal]) : ctrl.signal,
+    touch: arm,
+    dispose: (): void => {
+      if (idleTimer) clearTimeout(idleTimer)
+      clearTimeout(hardTimer)
+    }
+  }
 }
 
 export async function readErrorMessage(res: Response): Promise<never> {
@@ -72,8 +113,8 @@ export async function readErrorMessage(res: Response): Promise<never> {
   throw new ApiError(hint || `HTTP ${res.status}`, res.status, body)
 }
 
-/** 逐条产出 SSE data 载荷(兼容 \n 与 \r\n) */
-export async function* sseDataChunks(res: Response): AsyncGenerator<string> {
+/** 逐条产出 SSE data 载荷(兼容 \n 与 \r\n);onActivity 在每次收到字节时回调(空闲超时续期用) */
+export async function* sseDataChunks(res: Response, onActivity?: () => void): AsyncGenerator<string> {
   if (!res.body) throw new ApiError('响应无内容(SSE 流为空)')
   const reader = res.body.getReader()
   const decoder = new TextDecoder('utf-8')
@@ -83,6 +124,7 @@ export async function* sseDataChunks(res: Response): AsyncGenerator<string> {
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
+      onActivity?.()
       buffer += decoder.decode(value, { stream: true })
       let nl: number
       while ((nl = buffer.indexOf('\n')) >= 0) {

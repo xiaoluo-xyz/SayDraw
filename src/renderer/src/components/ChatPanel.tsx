@@ -212,6 +212,14 @@ function AssistantTurn({ message, now, live = false }: { message: ChatMessage; n
             {message.assetIds.length > 0 && <span>· 产出 {message.assetIds.length} 张图</span>}
           </div>
         )}
+
+        {/* 失败原因:不写出来就只有一个"出错",用户无从判断该怎么办 */}
+        {!live && message.error && (
+          <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[11px] leading-relaxed text-red-300">
+            <span className="font-medium">失败原因:</span>
+            {message.error}
+          </div>
+        )}
       </div>
     </div>
   )

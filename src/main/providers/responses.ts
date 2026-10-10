@@ -3,7 +3,7 @@
 // 中转站(如 cf.api.fan)与 OpenCode Go 的 gpt/grok 系模型走此规范
 
 import type { ChatProfile } from '@shared/types'
-import { ApiError, endpointUrl, gatewaySessionHeaders, readErrorMessage, sseDataChunks, withTimeout } from './http'
+import { ApiError, createIdleGuard, endpointUrl, gatewaySessionHeaders, readErrorMessage, sseDataChunks, withTimeout } from './http'
 import type { ChatStreamResult, LLMMessage, LLMTool, StreamChatOpts } from './chat'
 
 // ---------- 输入结构(LLMMessage → Responses input items) ----------
@@ -86,6 +86,8 @@ export async function responsesChatStream(opts: StreamChatOpts): Promise<ChatStr
   const { instructions, input } = convertInput(messages)
   const body = buildBody(profile, instructions, input, tools)
 
+  // 空闲超时:timeoutMs 内没有数据才中断
+  const guard = createIdleGuard(signal, timeoutMs)
   const res = await fetch(endpointUrl(profile.baseUrl, profile.chatPath, 'responses'), {
     method: 'POST',
     headers: {
@@ -94,7 +96,7 @@ export async function responsesChatStream(opts: StreamChatOpts): Promise<ChatStr
       ...gatewaySessionHeaders(profile.baseUrl, opts.sessionKey ?? 'default')
     },
     body: JSON.stringify(body),
-    signal: withTimeout(signal, timeoutMs)
+    signal: guard.signal
   })
   if (!res.ok) await readErrorMessage(res)
 
@@ -102,7 +104,7 @@ export async function responsesChatStream(opts: StreamChatOpts): Promise<ChatStr
   // key=item_id;只发 arguments.done 不发 delta 的实现也能覆盖
   const calls = new Map<string, { id: string; name: string; args: string }>()
 
-  for await (const data of sseDataChunks(res)) {
+  for await (const data of sseDataChunks(res, guard.touch)) {
     let json: {
       type?: string
       delta?: string
@@ -164,6 +166,7 @@ export async function responsesChatStream(opts: StreamChatOpts): Promise<ChatStr
     toolCalls.push({ id: slot.id || `call_${Math.random().toString(36).slice(2, 10)}`, name: slot.name, args })
   }
 
+  guard.dispose()
   return { content, toolCalls, finishReason: toolCalls.length ? 'tool_calls' : 'stop' }
 }
 

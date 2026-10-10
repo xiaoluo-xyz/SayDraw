@@ -84,6 +84,8 @@ export interface ChatMessage {
   startedAt?: number
   durationMs?: number
   stopReason?: 'completed' | 'aborted' | 'error'
+  /** 失败原因(仅 stopReason==='error' 时有值;落盘以便刷新后仍能看到为什么出错) */
+  error?: string
 }
 
 // ---------- 需求规格(ImageBrief) ----------
@@ -208,6 +210,7 @@ export interface AppSettings {
   imageModels: ImageModel[]
   activeChatModelId?: string
   activeImageModelId?: string
+  /** 对话请求空闲超时:连续这么久没有任何数据返回才中断(长回答不再被整请求 deadline 误杀) */
   chatTimeoutMs: number
   imageTimeoutMs: number
   /** 发送给 LLM 的历史图片上限(控制 token) */

@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { useSessionsStore } from '../stores/sessions'
 import { useChatStore } from '../stores/chat'
 
@@ -8,6 +9,14 @@ export default function Sidebar() {
   const create = useSessionsStore((s) => s.create)
   const remove = useSessionsStore((s) => s.remove)
   const setSettingsOpen = useSessionsStore((s) => s.setSettingsOpen)
+  const [version, setVersion] = useState('')
+
+  useEffect(() => {
+    window.api.app
+      .version()
+      .then(setVersion)
+      .catch(() => setVersion(''))
+  }, [])
 
   return (
     <aside className="flex w-[220px] shrink-0 flex-col bg-[#0d0f13]">
@@ -34,7 +43,7 @@ export default function Sidebar() {
       </nav>
 
       <div className="border-t border-zinc-800/80 px-4 py-3 text-[11px] text-zinc-600">
-        <p>v0.5.1 · 说画 SayDraw</p>
+        <p>{version ? `v${version} · ` : ''}说画 SayDraw</p>
       </div>
     </aside>
   )

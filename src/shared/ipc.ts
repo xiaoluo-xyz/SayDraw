@@ -17,6 +17,9 @@ export const IPC = {
   ASSETS_UPLOAD: 'assets:upload',
   ASSETS_CONTEXT_MENU: 'assets:context-menu',
 
+  /** 应用元信息(版本号等) */
+  APP_INFO: 'app:info',
+
   SETTINGS_GET: 'settings:get',
   SETTINGS_SAVE: 'settings:save',
   SETTINGS_SET_ACTIVE: 'settings:set-active',

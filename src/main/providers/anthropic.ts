@@ -2,7 +2,7 @@
 // 与 chat.ts 的 chatCompletionStream 返回同构结果,由 streamChatCompletion 分发
 
 import type { ChatProfile } from '@shared/types'
-import { ApiError, endpointUrl, gatewaySessionHeaders, readErrorMessage, sseDataChunks, withTimeout } from './http'
+import { ApiError, createIdleGuard, endpointUrl, gatewaySessionHeaders, readErrorMessage, sseDataChunks, withTimeout } from './http'
 import type { ChatStreamResult, LLMMessage, LLMTool } from './chat'
 
 interface ToolUseAcc {
@@ -128,6 +128,8 @@ export async function anthropicChatStream(opts: {
     body.tools = tools.map((t) => ({ name: t.function.name, description: t.function.description, input_schema: t.function.parameters }))
   }
 
+  // 空闲超时:timeoutMs 内没有数据才中断
+  const guard = createIdleGuard(signal, timeoutMs)
   const res = await fetch(messagesUrl(profile.baseUrl, profile.chatPath), {
     method: 'POST',
     headers: {
@@ -137,7 +139,7 @@ export async function anthropicChatStream(opts: {
       ...gatewaySessionHeaders(profile.baseUrl, opts.sessionKey ?? 'default')
     },
     body: JSON.stringify(body),
-    signal: withTimeout(signal, timeoutMs)
+    signal: guard.signal
   })
   if (!res.ok) await readErrorMessage(res)
 
@@ -145,7 +147,7 @@ export async function anthropicChatStream(opts: {
   let finishReason: string | null = null
   const toolAcc = new Map<number, ToolUseAcc>()
 
-  for await (const data of sseDataChunks(res)) {
+  for await (const data of sseDataChunks(res, guard.touch)) {
     let json: {
       type?: string
       index?: number
@@ -191,6 +193,7 @@ export async function anthropicChatStream(opts: {
     .filter((t) => t.name)
     .map((t) => ({ id: t.id || `call_${Math.random().toString(36).slice(2, 10)}`, name: t.name, args: safeParse(t.json) }))
 
+  guard.dispose()
   return { content, toolCalls, finishReason }
 }
 

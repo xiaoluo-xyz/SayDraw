@@ -382,6 +382,8 @@ class SettingsStore {
   }
 
   save(next: AppSettings): AppSettings {
+    // 兜底:未经 load() 直接 save() 时(如脚本/测试调用)也要能定位到文件
+    if (!this.file) this.file = path.join(app.getPath('userData'), 'settings.json')
     this.cache = normalizeAll({ ...next })
     dropOrphans(this.cache)
     // 激活指向失效回落

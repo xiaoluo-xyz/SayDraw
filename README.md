@@ -69,7 +69,20 @@ npm run typecheck  # 类型检查
 npm run dist       # 打包 portable + NSIS 安装包(dist-release/)
 ```
 
-测试:`scripts/mock-server.mjs` 提供本地 mock 模型服务(OpenAI/Anthropic 双规范),`scripts/e2e-driver.mjs` 通过 CDP 驱动端到端验证(注意:不要在正在使用的实例上运行)。
+测试:`scripts/mock-server.mjs` 提供本地 mock 模型服务(OpenAI/Anthropic/Responses 三规范,带 `/__stats` 观测与 `/__mode` 故障注入),`scripts/verify-fix.cjs` 在 Electron 里直接跑真实主进程代码,校验图片内联压缩、请求体预算与失败留痕(**全程只用系统临时目录,不读写用户数据**):
+
+```bash
+node scripts/mock-server.mjs                 # 终端 A
+node_modules\.bin\electron scripts\verify-fix.cjs   # 终端 B
+```
+
+`scripts/e2e-driver.mjs` 是 v3 设置结构之前的旧脚本(仍是扁平 profile 写法),尚未同步,别直接在正在使用的实例上跑。
+
+## 上下文与请求体积
+
+送模型的图片一律不用原图:主进程先把图缩到长边 ≤1280(蒙版/透明图放宽到 ≤4096,且平色透明图优先原样直传)、单张 base64 后 ≤1.5MB,再内联进对话请求;一次请求的内联图片总量另有 8MB 预算,超出的旧图不进请求、只在文本标注里留痕。磁盘上的原图始终不动,生图/编辑/蒙版用的都是原图。
+
+对话请求用**空闲超时**(设置里的「对话空闲超时」,默认 120s:连续这么久没有数据返回才中断)而不是整请求硬 deadline —— 长回答/长思考不再被误判成超时;另有 15 分钟总上限兜底。失败时原因会写进消息(界面红色「失败原因」),不再只有一个「出错」。
 
 ## 目录结构
 

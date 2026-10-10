@@ -873,7 +873,7 @@ function AdvancedPanel(props: { draft: AppSettings; patch: (p: Partial<AppSettin
     <div className="space-y-4">
       <h3 className="text-xs font-semibold text-zinc-300">高级</h3>
       <div className="grid max-w-md grid-cols-1 gap-3 text-xs text-zinc-400">
-        <Field label="对话超时(秒)">
+        <Field label="对话空闲超时(秒)" hint="连续这么久没有数据返回才中断;模型持续输出(含思考)不算超时">
           <input
             type="number"
             min={10}

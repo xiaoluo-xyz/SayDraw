@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto'
 import type { AgentEvent, ChatMessage, FileTextAttachment, ImageAsset, ImageBrief, MessageBlock, ToolCallRecord } from '@shared/types'
 import { getDb } from '../store/db'
 import { getSettings } from '../store/settings'
-import { assetToDataUrl } from '../store/assets'
+import { prepareInlineImage } from '../store/inlineImage'
 import { syncSpecFile } from '../store/projects'
 import { streamChatCompletion, type ContentPart, type LLMMessage, type LLMToolCall } from '../providers/chat'
 import { errText } from '../providers/http'
@@ -20,6 +20,17 @@ const activeRuns = new Map<string, AbortController>()
 /** 单张图粗估 token(视觉模型通用量级) */
 const IMAGE_TOKEN_EST = 1300
 const FILE_TEXT_MAX = 16_000
+/** 单次请求的内联图片总预算(base64 文本量);图片已压缩,这里是防"图多到把请求撑爆"的兜底 */
+export const INLINE_BUDGET_BYTES = 8_000_000
+/** 本轮新产出的图单独留的额度:刚画出来的图是本轮重点,不能因为历史图占满预算就被挤掉 */
+const FRESH_IMAGE_RESERVE = 3_000_000
+
+/** 内联图片预算账本:一次 run 内所有请求共用,分配时始终从最新的图往回给 */
+interface InlineBudget {
+  left: number
+  used: number
+  omitted: number
+}
 
 export function isRunning(sessionId: string): boolean {
   return activeRuns.has(sessionId)
@@ -66,28 +77,60 @@ function trimByContextWindow(messages: LLMMessage[], contextWindow: number, maxO
   return out
 }
 
-/** 构建图片标注 + 图片本体的 content parts */
-function buildAssetParts(assets: ImageAsset[], visionEnabled: boolean): ContentPart[] {
+/** 图片在上下文里的文字标注(蒙版带额外说明) */
+function assetNote(asset: ImageAsset): string {
+  if (asset.kind === 'mask') {
+    if (asset.label === 'overlay') {
+      return `[图片 ${asset.id}(蒙版标注图,作用于 ${asset.baseAssetId ?? '上一张图'}:彩色编号 1/2/3… 标出各处修改位置——编号 n 的颜色区域即第 n 处修改,结合用户消息中的编号说明理解)`
+    }
+    return `[图片 ${asset.id}(接口蒙版,作用于 ${asset.baseAssetId ?? '上一张图'}:透明区域=待修改;调用 edit_image 时 maskAssetId 应传此图 ID)]`
+  }
+  return `[图片 ${asset.id}(${KIND_LABEL[asset.kind] ?? asset.kind})]`
+}
+
+/**
+ * 按预算决定这次请求真正携带哪些图:从最新往回给(最近的画面最重要),
+ * 预算用尽后更老的图不入请求,只在文本标注里留痕。
+ * (导出以便脚本化验证:scripts/verify-fix.cjs)
+ */
+export function planInline(assetsInOrder: ImageAsset[], budget: InlineBudget): Set<string> {
+  const allowed = new Set<string>()
+  for (let i = assetsInOrder.length - 1; i >= 0; i--) {
+    const asset = assetsInOrder[i]
+    let bytes: number
+    try {
+      bytes = prepareInlineImage(asset).bytes
+    } catch {
+      continue // 文件缺失/不可读:当作这张图不存在
+    }
+    if (allowed.size > 0 && bytes > budget.left) {
+      budget.omitted += 1
+      continue
+    }
+    budget.left -= bytes
+    budget.used += bytes
+    allowed.add(asset.id)
+  }
+  return allowed
+}
+
+/** 构建图片标注 + 图片本体的 content parts(图片用压缩后的内联副本,名单外的不发送) */
+function buildAssetParts(assets: ImageAsset[], visionEnabled: boolean, allowed?: Set<string>): ContentPart[] {
   const parts: ContentPart[] = []
   const notes: string[] = []
   for (const asset of assets) {
-    if (asset.kind === 'mask') {
-      if (asset.label === 'overlay') {
-        notes.push(
-          `[图片 ${asset.id}(蒙版标注图,作用于 ${asset.baseAssetId ?? '上一张图'}:彩色编号 1/2/3… 标出各处修改位置——编号 n 的颜色区域即第 n 处修改,结合用户消息中的编号说明理解)`
-        )
-      } else {
-        notes.push(`[图片 ${asset.id}(接口蒙版,作用于 ${asset.baseAssetId ?? '上一张图'}:透明区域=待修改;调用 edit_image 时 maskAssetId 应传此图 ID)]`)
+    let note = assetNote(asset)
+    const sendable = visionEnabled && (!allowed || allowed.has(asset.id))
+    if (sendable) {
+      try {
+        parts.push({ type: 'image_url', image_url: { url: prepareInlineImage(asset).dataUrl } })
+      } catch {
+        note = `${note}(读取失败,未发送)`
       }
-      if (visionEnabled) {
-        parts.push({ type: 'image_url', image_url: { url: assetToDataUrl(asset) } })
-      }
-    } else {
-      notes.push(`[图片 ${asset.id}(${KIND_LABEL[asset.kind] ?? asset.kind})]`)
-      if (visionEnabled) {
-        parts.push({ type: 'image_url', image_url: { url: assetToDataUrl(asset) } })
-      }
+    } else if (visionEnabled) {
+      note = `${note}(未随本次请求发送:图片体积超出本次预算)`
     }
+    notes.push(note)
   }
   return [{ type: 'text', text: notes.join('\n') }, ...parts.filter((p) => p.type === 'image_url')]
 }
@@ -96,7 +139,7 @@ function buildAssetParts(assets: ImageAsset[], visionEnabled: boolean): ContentP
  * ① system 为静态文本(前缀缓存命中的前提)
  * ② 历史按序只读渲染,不随轮次变化
  * ③ 动态内容(需求规格状态/工作目录/最近图片)合并进最后一条 user 消息——尾部变化不破坏前缀 */
-function buildContext(sessionId: string, brief: ImageBrief): LLMMessage[] {
+function buildContext(sessionId: string, brief: ImageBrief, inlineBudget: InlineBudget): LLMMessage[] {
   const db = getDb()
   const settings = getSettings().load()
   const history = db.messages(sessionId)
@@ -104,7 +147,7 @@ function buildContext(sessionId: string, brief: ImageBrief): LLMMessage[] {
   const chatProfile = getSettings().activeChatProfile()
   const visionEnabled = chatProfile?.supportsVision !== false
 
-  // 图片预算:只带最近 N 张(含蒙版),过老的丢弃
+  // 图片数量预算:只带最近 N 张(含蒙版),过老的丢弃
   const referenced: string[] = []
   for (const m of history) {
     for (const id of m.assetIds) referenced.push(id)
@@ -112,21 +155,45 @@ function buildContext(sessionId: string, brief: ImageBrief): LLMMessage[] {
   const budget = new Set(referenced.slice(-settings.maxHistoryImages))
   const attached = new Set<string>()
 
+  // 先按"请求里的出现顺序"收集候选图,再按体积预算从最新往回分配(最近的画面最不能丢)
+  const historyAssets = new Map<string, ImageAsset[]>()
+  const candidates: ImageAsset[] = []
+  for (const m of history) {
+    if (m.role !== 'user') continue
+    const assets = m.assetIds
+      .map((id) => db.asset(id))
+      .filter((a): a is ImageAsset => a !== undefined && budget.has(a.id))
+    historyAssets.set(m.id, assets)
+    candidates.push(...assets)
+    for (const a of assets) attached.add(a.id)
+  }
+
+  // 尾部补充"尚未附着在历史中的最近图片",保证连续修图时模型看到最新画面
+  const visionImages = visionEnabled
+    ? db
+        .assets(sessionId)
+        .filter((a) => a.kind !== 'mask' && !attached.has(a.id))
+        .slice(-Math.min(3, settings.maxHistoryImages))
+    : []
+  candidates.push(...visionImages)
+
+  // 尾部兜底图可能比历史里的图更老,统一按创建时间排序后再分配,保证"最新的图最优先"
+  const allowed = visionEnabled
+    ? planInline([...candidates].sort((a, b) => a.createdAt - b.createdAt), inlineBudget)
+    : new Set<string>()
+
   const messages: LLMMessage[] = [{ role: 'system', content: SYSTEM_PROMPT }]
 
   for (const m of history) {
     if (m.role === 'user') {
-      const assets = m.assetIds
-        .map((id) => db.asset(id))
-        .filter((a): a is ImageAsset => a !== undefined && budget.has(a.id))
+      const assets = historyAssets.get(m.id) ?? []
       const textParts: string[] = [m.text.trim() || '(用户发送了图片)']
       // 文本附件以引用块注入
       for (const f of m.fileTexts ?? []) {
         textParts.push(`[附件 ${f.name}]\n${f.content.slice(0, FILE_TEXT_MAX)}`)
       }
       if (assets.length) {
-        const parts: ContentPart[] = [{ type: 'text', text: textParts.join('\n\n') }, ...buildAssetParts(assets, visionEnabled)]
-        for (const a of assets) attached.add(a.id)
+        const parts: ContentPart[] = [{ type: 'text', text: textParts.join('\n\n') }, ...buildAssetParts(assets, visionEnabled, allowed)]
         messages.push({ role: 'user', content: parts })
       } else {
         messages.push({ role: 'user', content: textParts.join('\n\n') })
@@ -138,18 +205,10 @@ function buildContext(sessionId: string, brief: ImageBrief): LLMMessage[] {
     }
   }
 
-  // 尾部补充"尚未附着在历史中的最近图片",保证连续修图时模型看到最新画面
-  const visionImages = visionEnabled
-    ? db
-        .assets(sessionId)
-        .filter((a) => a.kind !== 'mask' && !attached.has(a.id))
-        .slice(-Math.min(3, settings.maxHistoryImages))
-    : []
-
   // 动态状态块:合并进最后一条 user 消息(轮次间唯一变化的部分)
   let stateText = buildStateBlock(brief, session?.projectPath)
   if (visionImages.length) {
-    const parts = buildAssetParts(visionImages, true)
+    const parts = buildAssetParts(visionImages, true, allowed)
     const note = parts[0].type === 'text' ? parts[0].text : ''
     stateText += `\n\n【图片上下文】当前会话最近的图片(最新在后),供你了解当前画面状态:\n${note}`
     const last = messages[messages.length - 1]
@@ -287,10 +346,13 @@ export async function runAgentTurn(sessionId: string, opts: RunOptions, emit: (e
   // 迭代确认门状态:用户发消息即视为对本轮首个图片操作的授权;之后的自判微调需 ask_user 逐次确认
   let imageOps = 0
   let askApproval = false
+  // 本次 run 的内联图片预算:一次请求里所有图共用(图片已压缩,这里是总量兜底)
+  const inlineBudget: InlineBudget = { left: INLINE_BUDGET_BYTES, used: 0, omitted: 0 }
 
-  const finalize = (): ChatMessage | null => {
+  /** force=true 时即使一个字都没产出也落一条消息,保证"失败"在界面上留痕 */
+  const finalize = (force = false): ChatMessage | null => {
     collector.finishReasoning()
-    if (!collector.text.trim() && !collector.reasoning.trim() && toolRecords.length === 0) return null
+    if (!force && !collector.text.trim() && !collector.reasoning.trim() && toolRecords.length === 0) return null
     return {
       id: randomUUID(),
       sessionId,
@@ -330,7 +392,7 @@ export async function runAgentTurn(sessionId: string, opts: RunOptions, emit: (e
     db.addMessage(userMessage)
     emit({ type: 'user-message', sessionId, message: userMessage })
 
-    const llmMessages = buildContext(sessionId, brief)
+    const llmMessages = buildContext(sessionId, brief, inlineBudget)
     const timeoutMs = settingsStore.load().chatTimeoutMs
 
     // 无迭代上限:由模型自行判断何时结束(无工具调用的纯文本回复即结束)
@@ -467,7 +529,21 @@ export async function runAgentTurn(sessionId: string, opts: RunOptions, emit: (e
       if (batchAssetIds.length && !abort.signal.aborted) {
         const assets = batchAssetIds.map((id) => db.asset(id)).filter((a): a is ImageAsset => a !== undefined)
         if (assets.length) {
-          const parts = buildAssetParts(assets, chatProfile.supportsVision !== false)
+          const visionEnabled = chatProfile.supportsVision !== false
+          let allowed = new Set<string>()
+          if (visionEnabled) {
+            // 新产出的图走独立额度(至少 FRESH_IMAGE_RESERVE),用掉的量仍记进总账,保证请求体有上限
+            const batchBudget: InlineBudget = {
+              left: Math.max(inlineBudget.left, FRESH_IMAGE_RESERVE),
+              used: 0,
+              omitted: 0
+            }
+            allowed = planInline(assets, batchBudget)
+            inlineBudget.left -= batchBudget.used
+            inlineBudget.used += batchBudget.used
+            inlineBudget.omitted += batchBudget.omitted
+          }
+          const parts = buildAssetParts(assets, visionEnabled, allowed)
           const notePart = parts[0]
           const note = notePart.type === 'text' ? notePart.text : ''
           llmMessages.push({
@@ -500,9 +576,12 @@ export async function runAgentTurn(sessionId: string, opts: RunOptions, emit: (e
       }
     } else {
       stopReason = 'error'
-      emit({ type: 'error', sessionId, message: errText(err) })
-      const finalMsg = finalize()
+      const reason = errText(err)
+      emit({ type: 'error', sessionId, message: reason })
+      // 即使本轮一个字都没产出,也落一条带失败原因的消息(否则用户只看到"没了")
+      const finalMsg = finalize(true)
       if (finalMsg) {
+        finalMsg.error = reason
         db.addMessage(finalMsg)
         emit({ type: 'message-final', sessionId, message: finalMsg })
       }
