@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { assetUrl } from '@shared/ipc'
+import { failureHeadline } from '@shared/failure'
 import type { ChatMessage, ImageAsset, MessageBlock } from '@shared/types'
 import { useChatStore, selectStreaming } from '../stores/chat'
 import { useComposerStore } from '../stores/composer'
@@ -86,8 +87,20 @@ export default function ChatPanel() {
         <EmptyState onPick={(t) => setInputText(t)} />
       ) : (
         <div className="mx-auto flex max-w-3xl flex-col gap-6">
-          {messages.map((m) => (m.role === 'user' ? <UserTurn key={m.id} message={m} /> : <AssistantTurn key={m.id} message={m} now={now} />))}
-          {liveMessage && <AssistantTurn message={liveMessage} now={now} live />}
+          {messages.map((m, i) => {
+            if (m.role === 'user') return <UserTurn key={m.id} message={m} />
+            // 重试 = 把这条消息之前最后一条用户消息重发一遍(会话不变,失败痕迹保留)
+            const lastUser = [...messages.slice(0, i)].reverse().find((x) => x.role === 'user' && x.text.trim())
+            return (
+              <AssistantTurn
+                key={m.id}
+                message={m}
+                now={now}
+                onRetry={lastUser ? () => void useChatStore.getState().send(lastUser.text) : undefined}
+              />
+            )
+          })}
+          {liveMessage && <AssistantTurn message={liveMessage} now={now} live notices={streaming?.notices} />}
         </div>
       )}
     </div>
@@ -155,9 +168,24 @@ function UserTurn({ message }: { message: ChatMessage }) {
 
 // ---------- 助手消息(块式) ----------
 
-function AssistantTurn({ message, now, live = false }: { message: ChatMessage; now: number; live?: boolean }) {
+function AssistantTurn({
+  message,
+  now,
+  live = false,
+  notices,
+  onRetry
+}: {
+  message: ChatMessage
+  now: number
+  live?: boolean
+  /** 流式中的过程提示(自动重试 / 临时换模型) */
+  notices?: string[]
+  onRetry?: () => void
+}) {
   const blocks = normalizeBlocks(message)
   const hasToolRunning = blocks.some((b) => b.type === 'tool' && b.tool?.status === 'running')
+  const noticeList = notices ?? message.notices ?? []
+  const failure = message.failure
 
   return (
     <div className="flex gap-3">
@@ -170,6 +198,20 @@ function AssistantTurn({ message, now, live = false }: { message: ChatMessage; n
             <span className="inline-block h-3 w-3 animate-spin rounded-full border border-zinc-500 border-t-transparent" />
             {blocks.length === 0 || blocks.every((b) => b.type === 'reasoning' && b.endedAt === undefined) ? '思考中' : '处理中'}
             · 已用 <span className="tabular-nums">{fmtDuration(now - (message.startedAt ?? Date.now()))}</span>
+          </div>
+        )}
+
+        {/* 过程提示:自动重试、临时换后备模型 —— 按时间顺序排在正文之前,否则用户不知道"为什么答得不一样" */}
+        {noticeList.length > 0 && (
+          <div className="flex flex-col gap-1">
+            {noticeList.map((n, i) => (
+              <div
+                key={i}
+                className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-2.5 py-1.5 text-[11px] leading-relaxed text-amber-300"
+              >
+                ⚠ {n}
+              </div>
+            ))}
           </div>
         )}
 
@@ -204,20 +246,51 @@ function AssistantTurn({ message, now, live = false }: { message: ChatMessage; n
         )}
 
         {!live && message.durationMs !== undefined && message.stopReason && (
-          <div className="mt-1 flex items-center gap-2 border-t border-dashed border-zinc-800 pt-1.5 text-[11px] text-zinc-500">
+          <div className="mt-1 flex flex-wrap items-center gap-2 border-t border-dashed border-zinc-800 pt-1.5 text-[11px] text-zinc-500">
             <span className={`font-medium ${STOP_LABEL[message.stopReason]?.cls ?? ''}`}>
               {STOP_LABEL[message.stopReason]?.text ?? message.stopReason}
             </span>
             <span>· 用时 {fmtDuration(message.durationMs)}</span>
             {message.assetIds.length > 0 && <span>· 产出 {message.assetIds.length} 张图</span>}
+            {message.modelFallbackFrom && message.modelUsed && (
+              <span className="text-amber-400/80">· 本轮由 {message.modelUsed} 代跑</span>
+            )}
           </div>
         )}
 
-        {/* 失败原因:不写出来就只有一个"出错",用户无从判断该怎么办 */}
+        {/* 失败诊断:谁挂了 / 为什么 / 该怎么办 + 一键重试(以前只有一句英文报错) */}
         {!live && message.error && (
           <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[11px] leading-relaxed text-red-300">
-            <span className="font-medium">失败原因:</span>
-            {message.error}
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0 font-medium">
+                {failure ? failureHeadline(failure) : message.error}
+              </div>
+              {onRetry && (
+                <button
+                  className="shrink-0 rounded-md border border-red-400/40 px-2 py-0.5 text-[11px] text-red-200 transition-colors hover:bg-red-500/20"
+                  onClick={onRetry}
+                  title="用同一条消息重发(会沿用当前设置里的模型)"
+                >
+                  ↻ 重试
+                </button>
+              )}
+            </div>
+            {failure ? (
+              <>
+                {failure.hint && <div className="mt-1 text-red-200/85">建议:{failure.hint}</div>}
+                {failure.requestId && (
+                  <div className="mt-1 text-red-300/60">请求号 {failure.requestId}(报障时可用它找服务商核对)</div>
+                )}
+                {failure.detail && (
+                  <details className="mt-1">
+                    <summary className="cursor-pointer select-none text-red-300/70">原始报错</summary>
+                    <div className="mt-1 break-all font-mono text-[10px] text-red-300/70">{failure.detail}</div>
+                  </details>
+                )}
+              </>
+            ) : (
+              <div className="mt-1">{message.error}</div>
+            )}
           </div>
         )}
       </div>
@@ -240,7 +313,7 @@ function MessageImages({ assetIds, dense = false }: { assetIds: string[]; dense?
   const setBase = useCanvasStore((s) => s.setBase)
   const visible = assetIds
     .map((id) => assets[id])
-    .filter((a): a is ImageAsset => Boolean(a) && a.kind !== 'mask')
+    .filter((a): a is ImageAsset => Boolean(a) && a.kind !== 'mask' && a.kind !== 'annotation')
   if (visible.length === 0) return null
   return (
     <div className={`flex flex-wrap gap-2 ${dense ? 'justify-end' : ''}`}>

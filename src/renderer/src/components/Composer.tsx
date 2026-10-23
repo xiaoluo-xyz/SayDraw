@@ -5,7 +5,7 @@ import { useComposerStore } from '../stores/composer'
 import { useCanvasStore } from '../stores/canvas'
 import { useSettingsStore } from '../stores/settings'
 import { useSessionsStore } from '../stores/sessions'
-import ProjectBar, { useProjectPicker } from './ProjectBar'
+import ProjectBar from './ProjectBar'
 import QuestionPanel from './QuestionPanel'
 
 const DEFAULT_EFFORTS = ['none', 'low', 'medium', 'high', 'max']
@@ -183,40 +183,6 @@ export default function Composer() {
 
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
-
-  // 强制工作目录:未选择时阻断输入
-  const sessions = useSessionsStore((s) => s.sessions)
-  const currentSession = sessions.find((s) => s.id === sessionId)
-  const { pick, picking } = useProjectPicker()
-  const [pickError, setPickError] = useState('')
-
-  if (sessionId && currentSession && !currentSession.projectPath) {
-    return (
-      <div className="shrink-0 border-t border-zinc-800/80 bg-[#131519] px-4 pb-4 pt-3">
-        <div className="mx-auto max-w-3xl rounded-2xl border border-dashed border-emerald-500/50 bg-emerald-500/5 px-6 py-6 text-center">
-          <svg className="mx-auto mt-1 h-8 w-8 text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-            <path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
-          </svg>
-          <p className="mt-2 text-sm font-medium text-zinc-200">请先为本会话选择工作目录</p>
-          <p className="mt-1.5 text-xs leading-relaxed text-zinc-400">
-            所有生成的图片将存入工作目录的「生成图片」文件夹,并自动创建「素材」文件夹供你存放参考资产(AI 可直接浏览)。
-          </p>
-          <button
-            className="mt-3 rounded-full bg-emerald-600 px-5 py-2 text-xs font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
-            disabled={picking}
-            onClick={() =>
-              void pick(sessionId).then((r) => {
-                if (r.error) setPickError(r.error)
-              })
-            }
-          >
-            {picking ? '选择中…' : '选择工作目录'}
-          </button>
-          {pickError && <p className="mt-2 text-[11px] text-red-400">{pickError}</p>}
-        </div>
-      </div>
-    )
-  }
 
   const autoSize = (): void => {
     const el = textareaRef.current

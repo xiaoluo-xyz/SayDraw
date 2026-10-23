@@ -32,6 +32,33 @@ body {
   background: rgba(16, 185, 129, 0.4);
 }
 
+/* 无边框窗口:顶部没有系统标题栏,靠这些区块自己当拖拽条。
+   拖拽区里的按钮/输入框必须 no-drag,否则点不到(下面统一兜住)。 */
+.drag {
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+.drag button,
+.drag a,
+.drag input,
+.drag select,
+.drag textarea,
+.no-drag {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+/* 浮层(图片查看器 / 蒙版编辑器 / A-B 对比 / 导出 / 设置)打开时整体取消拖拽区。
+   app-region 是"窗口级命中区",不是普通绘制:浮层的 z-index 再高也挡不住它 ——
+   落在顶部 48px 拖拽带里的按钮会被系统当成标题栏吃掉(点击变成拖窗口),
+   表现就是"点了没反应"。所以浮层一开,shell 在 <html> 上打 data-overlay="1",
+   这里把 .drag 整体降级为 no-drag(浮层盖住了窗口按钮,不需要再拖窗口)。 */
+html[data-overlay='1'] .drag,
+html[data-overlay='1'] .drag * {
+  -webkit-app-region: no-drag !important;
+  app-region: no-drag !important;
+}
+
 input,
 textarea {
   outline: none;

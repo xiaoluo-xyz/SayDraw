@@ -10,8 +10,17 @@
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "verify:image": "node --no-warnings --experimental-strip-types scripts/verify-image-fallback.mjs",
     "start": "electron-vite preview",
-    "dist": "electron-vite build && electron-builder --win"
+    "dist": "electron-vite build && electron-builder --win",
+    "verify:composite": "node --no-warnings --experimental-strip-types scripts/verify-composite.mjs",
+    "verify:fidelity": "node --no-warnings scripts/verify-fidelity.mjs",
+    "verify:fidelity:live": "electron scripts/verify-fidelity-live.cjs",
+    "verify:hardcases": "electron scripts/verify-hardcases-live.cjs all",
+    "verify:composite:live": "electron scripts/verify-composite-live.cjs",
+    "verify:workspaces": "node --no-warnings --experimental-strip-types scripts/verify-workspaces.mjs",
+    "verify:recovery": "node --no-warnings scripts/verify-recovery.mjs",
+    "verify:recovery:live": "node --no-warnings scripts/verify-recovery-live.mjs"
   },
   "dependencies": {
     "konva": "^10.7.1",

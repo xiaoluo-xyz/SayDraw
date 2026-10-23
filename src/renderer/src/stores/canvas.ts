@@ -12,16 +12,27 @@ interface CanvasStore {
   activeBrushId: number
   /** 画笔显示直径(px,以 720px 宽的编辑视图为基准,内部换算归一化) */
   brushSize: number
+  /** 蒙版羽化像素(0 = 硬边) */
+  featherPx: number
   /** 接口用二值蒙版(透明=待修改) */
   maskDataUrl: string | null
   /** 模型看的彩色编号标注图 */
   overlayDataUrl: string | null
   maskBaseAssetId: string | null
   editorOpen: boolean
+  /** 多比例导出面板 */
+  exportOpen: boolean
+  /** A/B 对比:选两张图并排看 */
+  compareMode: boolean
+  compareA: string | null
+  compareB: string | null
   setBase: (assetId: string | null) => void
   setBrushMode: (on: boolean) => void
   setActiveBrush: (id: number) => void
   setBrushSize: (size: number) => void
+  setFeather: (px: number) => void
+  /** 删除某个编号的全部笔迹 */
+  removeBrush: (brushId: number) => void
   /** 追加/更新一笔(同一笔移动中重复传末笔) */
   upsertStroke: (stroke: MaskStroke, isUpdate: boolean) => void
   undo: () => void
@@ -30,6 +41,11 @@ interface CanvasStore {
   setMaskOutput: (mask: string | null, overlay: string | null) => void
   clearMask: () => void
   setEditorOpen: (open: boolean) => void
+  setExportOpen: (open: boolean) => void
+  toggleCompare: () => void
+  /** 对比模式下点选:先 A 后 B,重复点同一个则取消 */
+  pickCompare: (assetId: string) => void
+  clearCompare: () => void
 }
 
 export const useCanvasStore = create<CanvasStore>((set, get) => ({
@@ -38,10 +54,14 @@ export const useCanvasStore = create<CanvasStore>((set, get) => ({
   brushMode: false,
   activeBrushId: 1,
   brushSize: 28,
+  featherPx: 0,
   maskDataUrl: null,
   overlayDataUrl: null,
   maskBaseAssetId: null,
   editorOpen: false,
+  exportOpen: false,
+  compareMode: false,  compareA: null,
+  compareB: null,
 
   setBase: (assetId) => {
     if (get().maskBaseAssetId !== assetId) {
@@ -53,7 +73,9 @@ export const useCanvasStore = create<CanvasStore>((set, get) => ({
 
   setBrushMode: (on) => set({ brushMode: on }),
   setActiveBrush: (id) => set({ activeBrushId: id }),
-  setBrushSize: (size) => set({ brushSize: Math.min(120, Math.max(4, size)) }),
+  setBrushSize: (size) => set({ brushSize: Math.min(240, Math.max(4, Math.round(size))) }),
+  setFeather: (px) => set({ featherPx: Math.min(60, Math.max(0, Math.round(px))) }),
+  removeBrush: (brushId) => set({ strokes: get().strokes.filter((s) => s.brushId !== brushId) }),
 
   upsertStroke: (stroke, isUpdate) => {
     const strokes = [...get().strokes]
@@ -69,5 +91,22 @@ export const useCanvasStore = create<CanvasStore>((set, get) => ({
 
   clearMask: () => set({ maskDataUrl: null, overlayDataUrl: null, maskBaseAssetId: null, strokes: [] }),
 
-  setEditorOpen: (open) => set({ editorOpen: open })
+  setEditorOpen: (open) => set({ editorOpen: open }),
+  setExportOpen: (open) => set({ exportOpen: open }),
+
+  toggleCompare: () => {
+    const on = !get().compareMode
+    set(on ? { compareMode: true } : { compareMode: false, compareA: null, compareB: null })
+  },
+
+  pickCompare: (assetId) => {
+    if (!get().compareMode) return
+    const { compareA, compareB } = get()
+    if (compareA === assetId) return set({ compareA: null })
+    if (compareB === assetId) return set({ compareB: null })
+    if (!compareA) return set({ compareA: assetId })
+    set({ compareB: assetId })
+  },
+
+  clearCompare: () => set({ compareMode: false, compareA: null, compareB: null })
 }))

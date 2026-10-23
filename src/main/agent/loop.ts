@@ -3,15 +3,17 @@
 // 每轮产出按序 blocks(text / reasoning / tool),供前端块式渲染与折叠展示
 
 import { randomUUID } from 'node:crypto'
-import type { AgentEvent, ChatMessage, FileTextAttachment, ImageAsset, ImageBrief, MessageBlock, ToolCallRecord } from '@shared/types'
+import type { AgentEvent, ChatMessage, ChatProfile, FileTextAttachment, ImageAsset, ImageBrief, MessageBlock, ToolCallRecord } from '@shared/types'
+import { failureText, summarizeFailure, type FailureSummary } from '@shared/failure'
 import { getDb } from '../store/db'
 import { getSettings } from '../store/settings'
 import { prepareInlineImage } from '../store/inlineImage'
 import { syncSpecFile } from '../store/projects'
 import { streamChatCompletion, type ContentPart, type LLMMessage, type LLMToolCall } from '../providers/chat'
-import { errText } from '../providers/http'
+import { ApiError, errText } from '../providers/http'
 import { parseExplicitSize } from '../providers/images'
 import { cancelSessionQuestions } from './askUser'
+import { ChatRunError, streamChatWithRecovery } from './recovery'
 import { SYSTEM_PROMPT, buildStateBlock } from './systemPrompt'
 import { TOOL_DEFS, executeTool, type ToolCtx } from './tools'
 
@@ -47,7 +49,8 @@ const KIND_LABEL: Record<string, string> = {
   'user-upload': '用户上传',
   generated: '生成',
   edited: '编辑',
-  mask: '蒙版'
+  mask: '蒙版',
+  annotation: '标注'
 }
 
 function estimateTextTokens(text: string): number {
@@ -79,6 +82,12 @@ function trimByContextWindow(messages: LLMMessage[], contextWindow: number, maxO
 
 /** 图片在上下文里的文字标注(蒙版带额外说明) */
 function assetNote(asset: ImageAsset): string {
+  if (asset.kind === 'annotation') {
+    if (asset.meta?.inspect) {
+      return `[图片 ${asset.id}(分析用局部放大图,作用于 ${asset.baseAssetId ?? '底图'}:原图像素直接裁剪、没有重绘;只用来看清细节,不是交付成果)]`
+    }
+    return `[图片 ${asset.id}(坐标网格标注图,作用于 ${asset.baseAssetId ?? '底图'}:横竖各 10 格,每格 0.1;用它数格子读出 composite_image 的归一化坐标)]`
+  }
   if (asset.kind === 'mask') {
     if (asset.label === 'overlay') {
       return `[图片 ${asset.id}(蒙版标注图,作用于 ${asset.baseAssetId ?? '上一张图'}:彩色编号 1/2/3… 标出各处修改位置——编号 n 的颜色区域即第 n 处修改,结合用户消息中的编号说明理解)`
@@ -348,6 +357,17 @@ export async function runAgentTurn(sessionId: string, opts: RunOptions, emit: (e
   let askApproval = false
   // 本次 run 的内联图片预算:一次请求里所有图共用(图片已压缩,这里是总量兜底)
   const inlineBudget: InlineBudget = { left: INLINE_BUDGET_BYTES, used: 0, omitted: 0 }
+  // 实际在用的模型:主模型端点故障时会临时切到后备模型(只影响本轮,不改用户设置)
+  let activeProfile: ChatProfile = chatProfile
+  let fallbackFrom: string | undefined
+  /** 本轮过程提示(自动重试 / 临时换模型),随消息落盘 */
+  const notices: string[] = []
+
+  /** 后备候选:已排除当前模型;不支持视觉的模型不能用(上下文里有图) */
+  const fallbackCandidates = (keep: ChatProfile): ChatProfile[] =>
+    settingsStore
+      .fallbackChatProfiles(chatProfile.id)
+      .filter((p) => p.id !== keep.id && p.supportsVision !== false)
 
   /** force=true 时即使一个字都没产出也落一条消息,保证"失败"在界面上留痕 */
   const finalize = (force = false): ChatMessage | null => {
@@ -365,7 +385,10 @@ export async function runAgentTurn(sessionId: string, opts: RunOptions, emit: (e
       createdAt: Date.now(),
       startedAt,
       durationMs: Date.now() - startedAt,
-      stopReason
+      stopReason,
+      modelUsed: activeProfile.name,
+      ...(fallbackFrom ? { modelFallbackFrom: fallbackFrom } : {}),
+      ...(notices.length ? { notices: [...notices] } : {})
     }
   }
 
@@ -400,22 +423,39 @@ export async function runAgentTurn(sessionId: string, opts: RunOptions, emit: (e
       if (abort.signal.aborted) break
       brief = db.brief(sessionId)
 
-      const result = await streamChatCompletion({
-        profile: chatProfile,
-        messages: llmMessages,
-        tools: TOOL_DEFS,
-        timeoutMs,
-        sessionKey: sessionId,
+      // 主模型 →(抖动则退避重试)→ 后备模型;失败时抛 ChatRunError 带出完整诊断
+      const recovered = await streamChatWithRecovery({
+        profiles: [activeProfile, ...fallbackCandidates(activeProfile)],
+        attempt: (profile, onProgress) =>
+          streamChatCompletion({
+            profile,
+            messages: llmMessages,
+            tools: TOOL_DEFS,
+            timeoutMs,
+            sessionKey: sessionId,
+            signal: abort.signal,
+            onDelta: (t) => {
+              onProgress()
+              collector.pushText(t)
+              emit({ type: 'delta', sessionId, text: t })
+            },
+            onReasoningDelta: (t) => {
+              onProgress()
+              collector.pushReasoning(t)
+              emit({ type: 'reasoning-delta', sessionId, text: t })
+            }
+          }),
         signal: abort.signal,
-        onDelta: (t) => {
-          collector.pushText(t)
-          emit({ type: 'delta', sessionId, text: t })
-        },
-        onReasoningDelta: (t) => {
-          collector.pushReasoning(t)
-          emit({ type: 'reasoning-delta', sessionId, text: t })
+        emitNotice: (level, message) => {
+          notices.push(message)
+          emit({ type: 'notice', sessionId, level, message })
         }
       })
+      if (recovered.profile.id !== activeProfile.id) {
+        fallbackFrom = activeProfile.name
+        activeProfile = recovered.profile
+      }
+      const result = recovered.result
 
       if (result.toolCalls.length === 0) break
 
@@ -502,8 +542,9 @@ export async function runAgentTurn(sessionId: string, opts: RunOptions, emit: (e
           resultText = ret.text
           runAssetIds.push(...ret.assetIds)
           batchAssetIds.push(...ret.assetIds)
-          // 迭代门状态推进
-          if (call.name === 'generate_image' || call.name === 'edit_image') {
+          // 迭代门状态推进:只有**真的产出/改动了图片**才算用掉一次授权;
+          // 端点拒参、尺寸非法这类失败的重试不该把用户拉来点确认(2026-10-21 实测踩到)
+          if ((call.name === 'generate_image' || call.name === 'edit_image') && ret.ok && ret.assetIds.length > 0) {
             imageOps += 1
             askApproval = false // 授权已消费
           }
@@ -529,7 +570,7 @@ export async function runAgentTurn(sessionId: string, opts: RunOptions, emit: (e
       if (batchAssetIds.length && !abort.signal.aborted) {
         const assets = batchAssetIds.map((id) => db.asset(id)).filter((a): a is ImageAsset => a !== undefined)
         if (assets.length) {
-          const visionEnabled = chatProfile.supportsVision !== false
+          const visionEnabled = activeProfile.supportsVision !== false
           let allowed = new Set<string>()
           if (visionEnabled) {
             // 新产出的图走独立额度(至少 FRESH_IMAGE_RESERVE),用掉的量仍记进总账,保证请求体有上限
@@ -576,12 +617,27 @@ export async function runAgentTurn(sessionId: string, opts: RunOptions, emit: (e
       }
     } else {
       stopReason = 'error'
-      const reason = errText(err)
+      // 失败诊断:recovery 抛的 ChatRunError 已带好"谁挂了 + 试了哪些模型";
+      // 其它异常(建上下文、落盘等)现归类,同样给出可执行建议
+      const failure: FailureSummary =
+        err instanceof ChatRunError
+          ? err.failure
+          : summarizeFailure({
+              status: err instanceof ApiError ? err.status : undefined,
+              requestId: err instanceof ApiError ? err.requestId : undefined,
+              message: errText(err),
+              model: activeProfile.name
+            })
+      const tried = err instanceof ChatRunError && err.attempts.length > 1 ? err.attempts.map((a) => a.model) : []
+      const reason = `${failureText(failure)}${failure.requestId ? `(请求号 ${failure.requestId})` : ''}${
+        tried.length ? ` · 已尝试:${[...new Set(tried)].join(' / ')}` : ''
+      }`
       emit({ type: 'error', sessionId, message: reason })
       // 即使本轮一个字都没产出,也落一条带失败原因的消息(否则用户只看到"没了")
       const finalMsg = finalize(true)
       if (finalMsg) {
         finalMsg.error = reason
+        finalMsg.failure = failure
         db.addMessage(finalMsg)
         emit({ type: 'message-final', sessionId, message: finalMsg })
       }

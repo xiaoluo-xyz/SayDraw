@@ -346,6 +346,31 @@ export default function SettingsDialog() {
                 })}
                 {connections.length === 0 && <p className="px-3 py-6 text-center text-xs text-zinc-600">尚无分组,先新建一个连接分组</p>}
               </div>
+              {/* 主模型端点故障(上游 503 等)时的兜底策略 */}
+              {isChat && (
+                <div className="border-t border-zinc-800 p-2.5">
+                  <label className="mb-1 block text-[10px] font-medium text-zinc-400">主模型不可用时</label>
+                  <select
+                    className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1 text-[11px] text-zinc-200"
+                    value={draft.chatFallback ?? 'auto'}
+                    onChange={(e) => patch({ chatFallback: e.target.value })}
+                    title="上游抖动会自动重试;换模型只影响当轮,不会改动你的「当前使用」"
+                  >
+                    <option value="auto">自动换一个其它模型(推荐)</option>
+                    <option value="off">不换,只自动重试</option>
+                    {draft.chatModels
+                      .filter((m) => m.id !== draft.activeChatModelId)
+                      .map((m) => (
+                        <option key={m.id} value={m.id}>
+                          改用 {m.name || m.model}
+                        </option>
+                      ))}
+                  </select>
+                  <p className="mt-1 text-[10px] leading-snug text-zinc-600">
+                    网关返回 5xx/限流时,当轮临时改用后备模型并在对话里注明;下一轮仍先试「当前使用」的模型。
+                  </p>
+                </div>
+              )}
             </aside>
           )}
 
@@ -860,6 +885,17 @@ function ImageModelFields(props: { model: ImageModel; update: (p: Partial<ChatMo
           <option value="high">high</option>
           <option value="low">low</option>
         </select>
+      </Field>
+      <Field label="单张成本(元)" hint="用于会话成本估算;按该模型的单张价格填写,留空按 0 计">
+        <input
+          type="number"
+          min={0}
+          step="0.01"
+          value={m.pricePerImage ?? ''}
+          placeholder="如 0.35"
+          onChange={(e) => update({ pricePerImage: e.target.value === '' ? undefined : Math.max(0, Number(e.target.value)) })}
+          className={inputCls}
+        />
       </Field>
     </>
   )

@@ -9,6 +9,8 @@ export interface StreamingState {
   startedAt: number
   blocks: MessageBlock[]
   assetIds: string[]
+  /** 本轮过程提示(自动重试 / 临时换模型) */
+  notices: string[]
   error?: string
 }
 
@@ -34,6 +36,12 @@ interface ChatStore {
   reset: () => void
   send: (text: string, assetIds?: string[], confirmBrief?: boolean, fileTexts?: { name: string; content: string }[]) => Promise<void>
   cancel: () => Promise<void>
+  /** 选用候选图:草稿 → 正式版本链 */
+  promote: (assetId: string) => Promise<void>
+  /** 同参再生成(结果由主进程推送 asset-added 事件后自动出现) */
+  regenerate: (assetId: string) => Promise<ImageAsset | undefined>
+  /** 本地登记一个已上传的资产(上传接口不广播事件) */
+  upsertAsset: (asset: ImageAsset) => void
   handleEvent: (ev: AgentEvent) => void
 }
 
@@ -117,6 +125,23 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     if (sessionId) await window.api.chat.cancel(sessionId)
   },
 
+  promote: async (assetId) => {
+    const updated = await window.api.assets.promote(assetId)
+    if (!updated) return
+    set((s) => (s.assets[updated.id] ? { assets: { ...s.assets, [updated.id]: updated } } : {}))
+  },
+
+  regenerate: async (assetId) => {
+    try {
+      return await window.api.assets.regenerate(assetId)
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) })
+      return undefined
+    }
+  },
+
+  upsertAsset: (asset) => set((s) => ({ assets: { ...s.assets, [asset.id]: asset } })),
+
   handleEvent: (ev) => {
     const state = get()
     const cur = state.sessionId
@@ -128,7 +153,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
     const patchStreaming = (fn: (st: StreamingState) => StreamingState): void => {
       set((s) => {
-        const prev = s.streamingBySession[sid] ?? { active: false, startedAt: Date.now(), blocks: [], assetIds: [] }
+        const prev = s.streamingBySession[sid] ?? { active: false, startedAt: Date.now(), blocks: [], assetIds: [], notices: [] }
         return { streamingBySession: { ...s.streamingBySession, [sid]: fn(prev) } }
       })
     }
@@ -147,7 +172,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         if (isCurrentView) set((s) => ({ messages: [...s.messages, ev.message] }))
         break
       case 'run-start':
-        patchStreaming(() => ({ active: true, startedAt: Date.now(), blocks: [], assetIds: [] }))
+        patchStreaming(() => ({ active: true, startedAt: Date.now(), blocks: [], assetIds: [], notices: [] }))
         if (isCurrentView) set({ lastError: null })
         break
       case 'delta':
@@ -155,6 +180,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         break
       case 'reasoning-delta':
         patchStreaming((st) => ({ ...st, blocks: appendToLastReasoning(st.blocks, ev.text) }))
+        break
+      case 'notice':
+        patchStreaming((st) => ({ ...st, notices: [...st.notices, ev.message] }))
         break
       case 'brief-updated':
         if (isCurrentView) set({ brief: ev.brief })
@@ -211,6 +239,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
               text: st.blocks.filter((b) => b.type === 'text').map((b) => b.text ?? '').join(''),
               blocks: st.blocks,
               assetIds: st.assetIds,
+              notices: st.notices.length ? st.notices : undefined,
               startedAt: st.startedAt,
               durationMs: Date.now() - st.startedAt,
               stopReason: 'aborted',

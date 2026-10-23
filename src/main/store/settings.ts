@@ -14,6 +14,7 @@ import {
   type ImageProfile,
   type ModelConnection
 } from '@shared/types'
+import { orderFallbackModelIds } from '@shared/fallback'
 
 const ENC_PREFIX = 'enc:'
 
@@ -410,8 +411,13 @@ class SettingsStore {
 
   /** 拼装:分组 + 模型 → 扁平语言模型 profile(Provider/Agent 使用) */
   activeChatProfile(): ChatProfile | undefined {
+    return this.chatProfileOf(this.load().activeChatModelId)
+  }
+
+  /** 指定模型 id 的扁平 profile(后备模型、连通性测试共用) */
+  chatProfileOf(modelId: string | undefined): ChatProfile | undefined {
     const s = this.load()
-    const m = s.chatModels.find((x) => x.id === s.activeChatModelId)
+    const m = s.chatModels.find((x) => x.id === modelId)
     const c = m && s.chatConnections.find((x) => x.id === m.groupId)
     if (!m || !c) return undefined
     return {
@@ -429,6 +435,17 @@ class SettingsStore {
       reasoningEffort: m.reasoningEffort
     }
   }
+
+  /**
+   * 主模型不可用时的后备候选(已按优先级排好、已排除主模型)。
+   * 排序意图:优先换到**别的连接**(不同服务/Key,故障域不同),同连接内再按设置顺序。
+   */
+  fallbackChatProfiles(primaryId?: string): ChatProfile[] {
+    const s = this.load()
+    const ids = orderFallbackModelIds(s.chatModels, primaryId ?? s.activeChatModelId, s.chatFallback)
+    return ids.map((id) => this.chatProfileOf(id)).filter((p): p is ChatProfile => Boolean(p))
+  }
+
 
   /** 拼装:分组 + 模型 → 扁平生图 profile(Provider/Agent 使用) */
   activeImageProfile(): ImageProfile | undefined {
@@ -450,7 +467,8 @@ class SettingsStore {
       maxPromptChars: m.maxPromptChars,
       quality: m.quality,
       outputFormat: m.outputFormat,
-      inputFidelity: m.inputFidelity
+      inputFidelity: m.inputFidelity,
+      pricePerImage: m.pricePerImage
     }
   }
 }

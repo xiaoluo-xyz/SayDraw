@@ -38,8 +38,9 @@ function pathStroke(ctx: CanvasRenderingContext2D, stroke: MaskStroke, w: number
   ctx.stroke()
 }
 
-/** 接口用二值蒙版:黑底不透明,任何笔迹覆盖处变透明(OpenAI 约定:透明=待修改) */
-export function renderBinaryMask(strokes: MaskStroke[], w: number, h: number): string {
+/** 接口用二值蒙版:黑底不透明,任何笔迹覆盖处变透明(OpenAI 约定:透明=待修改)
+ *  feather > 0 时对笔迹做模糊,得到软边蒙版,接缝更自然 */
+export function renderBinaryMask(strokes: MaskStroke[], w: number, h: number, featherPx = 0): string {
   const canvas = document.createElement('canvas')
   canvas.width = w
   canvas.height = h
@@ -48,9 +49,57 @@ export function renderBinaryMask(strokes: MaskStroke[], w: number, h: number): s
   ctx.fillRect(0, 0, w, h)
   ctx.globalCompositeOperation = 'destination-out'
   ctx.strokeStyle = '#fff'
+  if (featherPx > 0) ctx.filter = `blur(${Math.min(60, featherPx)}px)`
   for (const stroke of strokes) pathStroke(ctx, stroke, w, h)
+  ctx.filter = 'none'
   return canvas.toDataURL('image/png')
 }
+
+/** 扩图:放大后的画布尺寸与原图居中偏移(纯函数,便于验证) */
+export function expandedSize(w: number, h: number, factor: number): { width: number; height: number; offsetX: number; offsetY: number } {
+  const width = Math.round(w * factor)
+  const height = Math.round(h * factor)
+  return { width, height, offsetX: Math.round((width - w) / 2), offsetY: Math.round((height - h) / 2) }
+}
+
+/** 扩图底图:原图居中放在更大的透明画布上(边缘透明 = 交给模型补全)
+ *  注意:必须传未污染的图源(用 fetch+createImageBitmap 得到),直接画 app-asset:// 的 <img> 会把画布污染,toDataURL 会抛 SecurityError */
+export function renderExpandedBase(source: CanvasImageSource, w: number, h: number, factor: number): string {
+  const { width, height, offsetX, offsetY } = expandedSize(w, h, factor)
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext('2d')!
+  ctx.drawImage(source, offsetX, offsetY, w, h)
+  return canvas.toDataURL('image/png')
+}
+
+/** 扩图蒙版:中间原图区域不透明(不动),四周透明(待补全) */
+export function renderBorderMask(w: number, h: number, factor: number): string {
+  const { width, height, offsetX, offsetY } = expandedSize(w, h, factor)
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext('2d')!
+  ctx.fillStyle = '#000'
+  ctx.fillRect(offsetX, offsetY, w, h)
+  return canvas.toDataURL('image/png')
+}
+
+/** 删除某个编号的全部笔迹(区域列表里的 ✕) */
+export function removeBrushStrokes(strokes: MaskStroke[], brushId: number): MaskStroke[] {
+  return strokes.filter((s) => s.brushId !== brushId)
+}
+
+/** 区域摘要:每个已用编号的笔迹数(渲染区域列表用) */
+export function regionSummary(strokes: MaskStroke[]): { id: number; count: number; color: string }[] {
+  return usedBrushIds(strokes).map((id) => ({
+    id,
+    count: strokes.filter((s) => s.brushId === id).length,
+    color: brushOf(id).color
+  }))
+}
+
 
 /** 模型看的彩色编号标注图:各编号画笔以其颜色半透明显示,并在笔迹质心画编号徽章 */
 export function renderColoredOverlay(strokes: MaskStroke[], w: number, h: number): string {

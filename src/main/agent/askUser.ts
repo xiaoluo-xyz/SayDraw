@@ -9,10 +9,26 @@ interface Pending {
 
 const pendings = new Map<string, Pending>()
 
-/** 挂起一个问题,直到用户作答(返回所选答案) */
-export function askUser(sessionId: string, question: AgentQuestion): Promise<string> {
+/** 问答默认超时:用户长时间不答不能让本轮永久挂起(10 分钟) */
+export const QUESTION_TIMEOUT_MS = 10 * 60_000
+
+/** 挂起一个问题,直到用户作答(返回所选答案);超时按「未回答」收尾 */
+export function askUser(sessionId: string, question: AgentQuestion, timeoutMs = QUESTION_TIMEOUT_MS): Promise<string> {
   return new Promise((resolve) => {
-    pendings.set(question.id, { sessionId, resolve })
+    const timer = setTimeout(() => {
+      if (!pendings.has(question.id)) return
+      pendings.delete(question.id)
+      resolve('用户未回答(超时)')
+    }, timeoutMs)
+    // 不让定时器把进程钉住
+    timer.unref?.()
+    pendings.set(question.id, {
+      sessionId,
+      resolve: (answer) => {
+        clearTimeout(timer)
+        resolve(answer)
+      }
+    })
   })
 }
 

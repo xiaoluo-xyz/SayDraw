@@ -6,3 +6,5 @@ dist-release/
 
 # local
 .zcode/
+_shots/
+_demo/

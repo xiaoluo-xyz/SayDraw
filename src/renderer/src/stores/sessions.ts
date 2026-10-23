@@ -9,10 +9,13 @@ interface SessionsStore {
   currentId: string | null
   settingsOpen: boolean
   load: () => Promise<void>
-  create: () => Promise<void>
+  /** 新建会话:不传工作目录 = 独立会话(直接开画);传了 = 在该工作区下新建 */
+  create: (projectPath?: string) => Promise<void>
   select: (id: string) => Promise<void>
   remove: (id: string) => Promise<void>
   rename: (id: string, title: string) => Promise<void>
+  /** 把会话移出工作区(只解除关联,不动磁盘文件) */
+  clearProject: (id: string) => Promise<void>
   setSettingsOpen: (open: boolean) => void
 }
 
@@ -29,8 +32,8 @@ export const useSessionsStore = create<SessionsStore>((set, get) => ({
     }
   },
 
-  create: async () => {
-    const s = await window.api.sessions.create()
+  create: async (projectPath) => {
+    const s = await window.api.sessions.create(projectPath ? { projectPath } : {})
     set({ sessions: [s, ...get().sessions], currentId: s.id })
     useChatStore.getState().reset()
     await useChatStore.getState().loadFor(s.id)
@@ -60,6 +63,12 @@ export const useSessionsStore = create<SessionsStore>((set, get) => ({
   rename: async (id, title) => {
     await window.api.sessions.rename(id, title)
     set({ sessions: get().sessions.map((s) => (s.id === id ? { ...s, title } : s)) })
+  },
+
+  clearProject: async (id) => {
+    const updated = await window.api.sessions.clearProject(id)
+    if (!updated) return
+    set({ sessions: get().sessions.map((s) => (s.id === id ? { ...s, projectPath: undefined } : s)) })
   },
 
   setSettingsOpen: (open) => set({ settingsOpen: open })

@@ -1,5 +1,8 @@
 // 主进程 / preload / 渲染进程共享的类型契约
 
+import type { FailureSummary } from './failure'
+import type { EditGuardReport, LocalPaintReport } from './fidelity'
+
 // ---------- 会话与消息 ----------
 
 export interface SessionSummary {
@@ -13,7 +16,51 @@ export interface SessionSummary {
   projectPath?: string
 }
 
-export type AssetKind = 'user-upload' | 'generated' | 'edited' | 'mask'
+export type AssetKind = 'user-upload' | 'generated' | 'edited' | 'mask' | 'annotation'
+
+/** 生成参数快照:让每张图都能回答「它用什么参数生成的」,并支持同参复现 */
+export interface ImageMeta {
+  /** 生图模型 ID */
+  model?: string
+  /** 服务名(分组/模型),如 GPT-Image-2 (cf.api.fan)/gpt-image-2 */
+  provider?: string
+  /** 请求的分辨率 */
+  size?: string
+  /** 接口实际返回的分辨率(与请求不一致时说明被降级) */
+  actualSize?: string
+  ratio?: string
+  quality?: string
+  /** 参考图资产 ID(融合/换风格时) */
+  referenceAssetIds?: string[]
+  /** 编辑源图 ID */
+  editedFrom?: string[]
+  /** 本次编辑是否带蒙版 */
+  masked?: boolean
+  /** 本次编辑用的蒙版资产 */
+  maskAssetId?: string
+  /** 候选数量(一次多张时) */
+  variants?: number
+  /** 被服务拒绝而丢弃的可选参数 */
+  dropped?: string[]
+  /** 生成耗时(毫秒) */
+  elapsedMs?: number
+  /** 本次成本估算(元),按模型单价 × 张数 */
+  cost?: number
+  /** 本地合成产物(不调用生图服务,¥0,可重复) */
+  local?: boolean
+  /** 本地合成的算子清单(人话描述,用于参数面板/配方) */
+  ops?: string[]
+  /** 合成用到的素材图 ID(贴上去的那张、蒙版等) */
+  sourceAssetIds?: string[]
+  /** 只为看清细节而做的分析图(不进版本树、不算交付成果) */
+  inspect?: boolean
+  /** 版本链根 = 用户最初上传/生成的那张;后续编辑都拿它当比对基线 */
+  originAssetId?: string
+  /** 保真合成报告:允许区域外 0 改动、边界锚定率、区域外改动聚集处 */
+  guard?: EditGuardReport
+  /** 本地确定性换色报告(逐像素换色,不重绘) */
+  paint?: LocalPaintReport
+}
 
 export interface ImageAsset {
   id: string
@@ -32,6 +79,12 @@ export interface ImageAsset {
   height?: number
   /** 生成/编辑此图时使用的提示词 */
   prompt?: string
+  /** 生成参数快照(用于同参复现与排查) */
+  meta?: ImageMeta
+  /** 候选图:一次生成多张供挑选,用户"选用"前不进入正式版本链 */
+  draft?: boolean
+  /** 同批候选的批次标识(一次多候选生成共享) */
+  batchId?: string
   createdAt: number
 }
 
@@ -86,6 +139,14 @@ export interface ChatMessage {
   stopReason?: 'completed' | 'aborted' | 'error'
   /** 失败原因(仅 stopReason==='error' 时有值;落盘以便刷新后仍能看到为什么出错) */
   error?: string
+  /** 结构化失败诊断(新版;error 仍保留,旧数据/其它调用方不受影响) */
+  failure?: FailureSummary
+  /** 本轮实际使用的模型(自动后备时与设置里的当前模型不同) */
+  modelUsed?: string
+  /** 有值=主模型不可用,本轮临时改用了这个模型 */
+  modelFallbackFrom?: string
+  /** 本轮过程提示(自动重试、临时换模型等),随消息落盘,刷新后仍可见 */
+  notices?: string[]
 }
 
 // ---------- 需求规格(ImageBrief) ----------
@@ -201,6 +262,8 @@ export interface ImageModel {
   outputFormat?: string
   /** 编辑接口 input_fidelity;不填不发送 */
   inputFidelity?: string
+  /** 单张成本估算(元/张),用于会话成本可见;不填按 0 计 */
+  pricePerImage?: number
 }
 
 export interface AppSettings {
@@ -210,6 +273,11 @@ export interface AppSettings {
   imageModels: ImageModel[]
   activeChatModelId?: string
   activeImageModelId?: string
+  /**
+   * 主对话模型不可用(上游 5xx / 限流 / 模型端点故障)时的后备策略:
+   * 未设置或 'auto' = 自动挑一个其它模型顶一轮(默认)· 'off' = 只重试不换模型 · 具体模型 id = 就用它
+   */
+  chatFallback?: string
   /** 对话请求空闲超时:连续这么久没有任何数据返回才中断(长回答不再被整请求 deadline 误杀) */
   chatTimeoutMs: number
   imageTimeoutMs: number
@@ -252,6 +320,8 @@ export interface ImageProfile {
   quality?: string
   outputFormat?: string
   inputFidelity?: string
+  /** 单张成本估算(元/张) */
+  pricePerImage?: number
 }
 
 /** /models 返回的模型元数据 */
@@ -335,6 +405,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   ],
   activeChatModelId: DEEPSEEK_CHAT_MODEL_ID,
   activeImageModelId: GPT_IMAGE2_MODEL_ID,
+  chatFallback: 'auto',
   chatTimeoutMs: 120_000,
   imageTimeoutMs: 600_000,
   maxHistoryImages: 6,
@@ -344,6 +415,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
 export interface TestResult {
   ok: boolean
   message: string
+}
+
+/** 窗口状态(无边框窗口的自绘标题栏按钮用) */
+export interface WindowState {
+  maximized: boolean
 }
 
 // ---------- Agent 事件(主进程 → 渲染进程) ----------
@@ -383,6 +459,8 @@ export type AgentEvent =
   | { type: 'ask-user'; sessionId: string; question: AgentQuestion }
   | { type: 'message-final'; sessionId: string; message: ChatMessage }
   | { type: 'error'; sessionId: string; message: string }
+  /** 过程提示(自动重试/临时切模型):不打断本轮,只在对话里留一行说明 */
+  | { type: 'notice'; sessionId: string; level: 'info' | 'warn'; message: string }
   | { type: 'run-end'; sessionId: string }
 
 // ---------- 会话历史加载 ----------

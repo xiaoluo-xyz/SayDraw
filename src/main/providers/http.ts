@@ -5,12 +5,26 @@ import { app } from 'electron'
 export class ApiError extends Error {
   status?: number
   body?: string
-  constructor(message: string, status?: number, body?: string) {
+  /** 网关给的请求号(OpenCode 的 x-opencode-log-id / cf-ray 等),报障时能对上服务端日志 */
+  requestId?: string
+  constructor(message: string, status?: number, body?: string, requestId?: string) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.body = body
+    this.requestId = requestId
   }
+}
+
+/** 各网关用来标识单次请求的响应头,按优先级取第一个非空的 */
+const REQUEST_ID_HEADERS = ['x-opencode-log-id', 'x-request-id', 'request-id', 'cf-ray', 'x-amzn-requestid', 'x-served-by']
+
+export function requestIdOf(res: Response): string | undefined {
+  for (const name of REQUEST_ID_HEADERS) {
+    const v = res.headers.get(name)
+    if (v && v.trim()) return v.trim().slice(0, 80)
+  }
+  return undefined
 }
 
 /** baseUrl(如 https://host/v1)+ 路径(/chat/completions) */
@@ -110,7 +124,13 @@ export async function readErrorMessage(res: Response): Promise<never> {
   } catch {
     // 非 JSON 响应体
   }
-  throw new ApiError(hint || `HTTP ${res.status}`, res.status, body)
+  // 鉴权失败是最常见的"看起来没反应":把原因说清楚,用户才知道该去设置里改 Key
+  if (res.status === 401 || res.status === 403) {
+    const advice = 'API Key 可能已失效、被撤销或额度不足,请到设置里检查对应服务'
+    hint = hint ? `${hint}(${advice})` : `鉴权失败(HTTP ${res.status}):${advice}`
+  }
+  if (!hint) hint = body.trim() ? body.trim().slice(0, 200) : ''
+  throw new ApiError(hint || `HTTP ${res.status}`, res.status, body, requestIdOf(res))
 }
 
 /** 逐条产出 SSE data 载荷(兼容 \n 与 \r\n);onActivity 在每次收到字节时回调(空闲超时续期用) */

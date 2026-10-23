@@ -4,7 +4,8 @@ import { app } from 'electron'
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import type { AssetKind, ImageAsset } from '@shared/types'
+import type { AssetKind, ImageAsset, ImageMeta } from '@shared/types'
+import { probeImageSize } from '../providers/imageMeta'
 import { getDb } from './db'
 
 export function assetsRoot(): string {
@@ -45,29 +46,7 @@ const MIME_EXT: Record<string, string> = {
   'image/gif': 'gif'
 }
 
-// PNG / JPEG 尺寸探测(避免引入 sharp 等原生依赖)
-function probeSize(buf: Buffer, mime: string): { width?: number; height?: number } {
-  try {
-    if (mime === 'image/png' && buf.length > 24 && buf.readUInt32BE(12) === 0x49484452) {
-      return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) }
-    }
-    if (mime === 'image/jpeg') {
-      let off = 2
-      while (off + 9 < buf.length) {
-        if (buf[off] !== 0xff) break
-        const marker = buf[off + 1]
-        const size = buf.readUInt16BE(off + 2)
-        if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
-          return { height: buf.readUInt16BE(off + 5), width: buf.readUInt16BE(off + 7) }
-        }
-        off += 2 + size
-      }
-    }
-  } catch {
-    // 解析失败不影响主流程
-  }
-  return {}
-}
+// PNG / JPEG 尺寸探测由 providers/imageMeta 提供(纯函数,与生图侧共用同一套实现)
 
 export function newAssetId(): string {
   return `asset-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`
@@ -82,6 +61,9 @@ function persistBuffer(opts: {
   baseAssetId?: string
   prompt?: string
   label?: string
+  draft?: boolean
+  batchId?: string
+  meta?: ImageMeta
 }): ImageAsset {
   const { sessionId, buffer, mime } = opts
   const dir = sessionAssetsDir(sessionId)
@@ -90,7 +72,7 @@ function persistBuffer(opts: {
   const id = newAssetId()
   const fileName = `${id}.${ext}`
   fs.writeFileSync(path.join(dir, fileName), buffer)
-  const { width, height } = probeSize(buffer, mime)
+  const { width, height } = probeImageSize(buffer, mime)
   const asset: ImageAsset = {
     id,
     sessionId,
@@ -103,6 +85,9 @@ function persistBuffer(opts: {
     width,
     height,
     prompt: opts.prompt,
+    meta: opts.meta,
+    draft: opts.draft,
+    batchId: opts.batchId,
     createdAt: Date.now()
   }
   return getDb().addAsset(asset)
@@ -129,7 +114,12 @@ export function saveBufferAsset(opts: {
   mime: string
   kind: AssetKind
   parentId?: string
+  baseAssetId?: string
+  label?: string
   prompt?: string
+  draft?: boolean
+  batchId?: string
+  meta?: ImageMeta
 }): ImageAsset {
   return persistBuffer(opts)
 }

@@ -60,9 +60,8 @@ export interface ProjectSetupResult {
   createdFiles: string[]
 }
 
-/** 设置会话的工作目录;自动初始化:要求.md / 需求规格.md / 素材/ / 生成图片/ */
-export function setSessionProject(sessionId: string, dir: string): ProjectSetupResult {
-  const db = getDb()
+/** 幂等准备一个工作目录(不涉及会话):要求.md / 需求规格.md / 素材/ / 生成图片/ */
+export function ensureProjectFiles(dir: string): ProjectSetupResult {
   const resolved = path.resolve(dir)
   const stat = fs.statSync(resolved)
   if (!stat.isDirectory()) throw new Error('所选路径不是文件夹')
@@ -87,10 +86,15 @@ export function setSessionProject(sessionId: string, dir: string): ProjectSetupR
     createdFiles.push('生成图片/')
   }
 
-  db.setProjectPath(sessionId, resolved)
-  // 立即用当前 brief 刷新一次规格文件
-  syncSpecFile(sessionId)
   return { path: resolved, createdFiles }
+}
+
+/** 设置会话的工作目录(目录文件已就绪时直接调用;会立刻同步一次需求规格) */
+export function setSessionProject(sessionId: string, dir: string): ProjectSetupResult {
+  const result = ensureProjectFiles(dir)
+  getDb().setProjectPath(sessionId, result.path)
+  syncSpecFile(sessionId)
+  return result
 }
 
 export function clearSessionProject(sessionId: string): void {

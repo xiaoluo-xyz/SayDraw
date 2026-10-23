@@ -1,8 +1,16 @@
 // OpenAI 兼容图片接口:/images/generations(文生图)与 /images/edits(编辑/蒙版重绘)
-// 归一化各家差异:b64_json 或 url 返回、size 不支持时自动降级重试
+// 归一化各家差异:b64_json 或 url 返回;可选参数被拒时「逐个降级」而不是一次全丢
+// (旧实现在一个参数不被支持时会把 size/quality/format 全部丢掉,导致 4K、16:9、高清被静默降成 1024 方图)
 
 import type { ImageProfile } from '@shared/types'
 import { ApiError, joinUrl, readErrorMessage, withTimeout } from './http'
+import {
+  describeDropped,
+  probeImageSize,
+  sizeText,
+  withParamFallback,
+  type OptionalImageParam
+} from './imageMeta'
 
 const RATIO_SIZE: Record<string, string> = {
   '1:1': '1024x1024',
@@ -25,9 +33,68 @@ export function parseExplicitSize(size?: string): string | null {
   return `${m[1]}x${m[2]}`
 }
 
+/**
+ * 常见生图端点(含 GPT-Image 系)的长边上限。
+ * 2026-10-21 实测 cf.api.fan:传 3072x4096 直接被拒 ——
+ * "invalid size 3072x4096. The longest edge must be less than or equal to 3840"。
+ * 与其把请求发出去吃一个 400,不如本地按比例收敛,并如实告诉用户"被收敛成多少"。
+ */
+export const MAX_IMAGE_EDGE = 3840
+
+/**
+ * 尺寸约束(2026-10-22 实测 cf.api.fan):
+ *   - 长边 ≤ 3840
+ *   - 宽高都必须是 16 的倍数(传 1000x640 被拒:Width and height must both be divisible by 16)
+ * 与其把请求发出去吃 400,不如本地收敛,并如实告知"原请求被改成了多少"。
+ */
+export const IMAGE_SIZE_MULTIPLE = 16
+
+/** 端点最小像素量(低于它直接 400:Requested resolution is below the current minimum pixel budget) */
+export const MIN_IMAGE_PIXELS = 1_048_576
+
+/** 把尺寸收敛到:长边 ≤ MAX_IMAGE_EDGE、宽高为 16 的倍数、像素量 ≥ MIN_IMAGE_PIXELS(保持比例) */
+export function clampImageSize(size: string): { size: string; clamped: boolean; from?: string } {
+  const m = /^(\d{2,5})\s*[x×]\s*(\d{2,5})$/i.exec(size.trim())
+  if (!m) return { size, clamped: false }
+  const w = Number(m[1])
+  const h = Number(m[2])
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return { size, clamped: false }
+  const k = Math.min(1, MAX_IMAGE_EDGE / Math.max(w, h))
+  const snap = (v: number): number =>
+    Math.max(64, Math.round((v * k) / IMAGE_SIZE_MULTIPLE) * IMAGE_SIZE_MULTIPLE)
+  let nw = snap(w)
+  let nh = snap(h)
+  if (nw * nh < MIN_IMAGE_PIXELS) {
+    const f = Math.sqrt(MIN_IMAGE_PIXELS / (nw * nh))
+    const up = (v: number): number =>
+      Math.min(MAX_IMAGE_EDGE, Math.max(64, Math.ceil((v * f) / IMAGE_SIZE_MULTIPLE) * IMAGE_SIZE_MULTIPLE))
+    nw = up(nw)
+    nh = up(nh)
+    while (nw * nh < MIN_IMAGE_PIXELS && (nw < MAX_IMAGE_EDGE || nh < MAX_IMAGE_EDGE)) {
+      if (nw <= nh && nw < MAX_IMAGE_EDGE) nw += IMAGE_SIZE_MULTIPLE
+      else if (nh < MAX_IMAGE_EDGE) nh += IMAGE_SIZE_MULTIPLE
+      else break
+    }
+  }
+  if (nw === w && nh === h) return { size: `${w}x${h}`, clamped: false }
+  return { size: `${nw}x${nh}`, clamped: true, from: `${w}x${h}` }
+}
+
 interface RawImage {
   b64_json?: string
   url?: string
+}
+
+export interface GeneratedImages {
+  buffers: Buffer[]
+  /** 因端点不支持而被丢弃的可选参数(需如实告知用户"画质/尺寸被降级") */
+  dropped: OptionalImageParam[]
+  /** 请求的分辨率(已按端点上限收敛) */
+  requestedSize?: string
+  /** 原请求尺寸(被本地收敛时才有值) */
+  clampedFrom?: string
+  /** 接口实际返回的首张分辨率 */
+  actualSize?: string
 }
 
 async function extractBuffers(json: { data?: RawImage[] }, timeoutMs: number): Promise<Buffer[]> {
@@ -54,27 +121,29 @@ function guessMime(buffer: Buffer): string {
 }
 
 /**
- * 可选参数(size/quality/output_format/input_fidelity)被端点拒绝时(HTTP 400 且报文提及参数不支持),
- * 自动去掉全部可选参数重试一次 —— 兼容各家用语不一的"不支持参数"报错
+ * 端点拒绝某个可选参数(HTTP 400 且报文提及参数不支持)时的判定。
+ * 各家用语不一,故按关键词宽匹配,再由 imageMeta 决定丢哪一个。
  */
 function isUnsupportedParamError(err: unknown): boolean {
   return (
     err instanceof ApiError &&
     err.status === 400 &&
-    /parameter|参数|not support|unsupported|does not support|不支持/i.test(err.message)
+    /parameter|参数|not support|unsupported|does not support|not allowed|不支持/i.test(err.message)
   )
 }
 
-async function withParamFallback<T>(attempt: (withOptional: boolean) => Promise<T>): Promise<T> {
-  try {
-    return await attempt(true)
-  } catch (err) {
-    if (isUnsupportedParamError(err)) return attempt(false)
-    throw err
-  }
-}
+/**
+ * 逐参数降级(实现见 imageMeta.withParamFallback):
+ * 端点只拒绝 quality 时不会连带丢掉 size / output_format。
+ */
 
-async function postImages(url: string, apiKey: string, body: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal): Promise<{ data?: RawImage[] }> {
+async function postImages(
+  url: string,
+  apiKey: string,
+  body: Record<string, unknown>,
+  timeoutMs: number,
+  signal?: AbortSignal
+): Promise<{ data?: RawImage[] }> {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
@@ -85,32 +154,48 @@ async function postImages(url: string, apiKey: string, body: Record<string, unkn
   return (await res.json()) as { data?: RawImage[] }
 }
 
-/** 文生图;size 显式优先,其次比例映射;size 被拒绝(HTTP 400 且报文含 size)时自动降级 */
+/** 文生图;size 显式优先,其次比例映射;quality 可覆盖模型配置(高清档) */
 export async function generateImages(opts: {
   profile: ImageProfile
   prompt: string
   ratio?: string
   size?: string
   n: number
+  quality?: string
   timeoutMs: number
   signal?: AbortSignal
-}): Promise<Buffer[]> {
+}): Promise<GeneratedImages> {
   const { profile, prompt, ratio, size, n, timeoutMs, signal } = opts
   if (!profile.baseUrl || !profile.model) throw new ApiError('生图服务配置不完整(缺 baseUrl 或模型名)')
   if (!profile.apiKey) throw new ApiError('生图服务未配置 API Key')
 
   const url = joinUrl(profile.baseUrl, profile.genPath || '/images/generations')
-  const explicit = parseExplicitSize(size) ?? ratioToSize(ratio)
+  const rawRequested = parseExplicitSize(size) ?? ratioToSize(ratio)
+  const fit = rawRequested ? clampImageSize(rawRequested) : { size: '', clamped: false }
+  const requested = rawRequested ? fit.size : undefined
+  const quality = (opts.quality ?? '').trim() || profile.quality
 
-  return withParamFallback(async (withOptional) => {
+  const optional: OptionalImageParam[] = []
+  if (requested) optional.push('size')
+  if (quality) optional.push('quality')
+  if (profile.outputFormat) optional.push('output_format')
+
+  const { value: buffers, dropped } = await withParamFallback(optional, async (active) => {
     const body: Record<string, unknown> = { model: profile.model, prompt, n }
-    if (withOptional && explicit) body.size = explicit
-    if (withOptional && profile.quality) body.quality = profile.quality
-    if (withOptional && profile.outputFormat) body.output_format = profile.outputFormat
+    if (active.includes('size') && requested) body.size = requested
+    if (active.includes('quality') && quality) body.quality = quality
+    if (active.includes('output_format') && profile.outputFormat) body.output_format = profile.outputFormat
 
     const json = await postImages(url, profile.apiKey, body, timeoutMs, signal)
     return extractBuffers(json, timeoutMs)
-  })
+  }, isUnsupportedParamError)
+
+  return {
+    buffers,
+    dropped,
+    requestedSize: requested,
+    actualSize: sizeText(probeImageSize(buffers[0], guessMime(buffers[0])))
+  }
 }
 
 /** 编辑图片(整图指令编辑、蒙版局部重绘、多参考图融合),multipart/form-data
@@ -122,18 +207,28 @@ export async function editImage(opts: {
   mask?: Buffer
   ratio?: string
   size?: string
+  quality?: string
   timeoutMs: number
   signal?: AbortSignal
-}): Promise<Buffer[]> {
+}): Promise<GeneratedImages> {
   const { profile, prompt, images, mask, ratio, size, timeoutMs, signal } = opts
   if (!profile.baseUrl || !profile.model) throw new ApiError('生图服务配置不完整(缺 baseUrl 或模型名)')
   if (!profile.apiKey) throw new ApiError('生图服务未配置 API Key')
   if (!images.length) throw new ApiError('缺少输入图片')
 
   const url = joinUrl(profile.baseUrl, profile.editPath || '/images/edits')
-  const explicit = parseExplicitSize(size) ?? ratioToSize(ratio)
+  const rawRequested = parseExplicitSize(size) ?? ratioToSize(ratio)
+  const fit = rawRequested ? clampImageSize(rawRequested) : { size: '', clamped: false }
+  const requested = rawRequested ? fit.size : undefined
+  const quality = (opts.quality ?? '').trim() || profile.quality
 
-  return withParamFallback(async (withOptional) => {
+  const optional: OptionalImageParam[] = []
+  if (requested) optional.push('size')
+  if (quality) optional.push('quality')
+  if (profile.outputFormat) optional.push('output_format')
+  if (profile.inputFidelity) optional.push('input_fidelity')
+
+  const { value: buffers, dropped } = await withParamFallback(optional, async (active) => {
     const form = new FormData()
     form.append('model', profile.model)
     form.append('prompt', prompt)
@@ -151,10 +246,10 @@ export async function editImage(opts: {
         form.append('image[]', blob, `image.${ext}`)
       }
     }
-    if (withOptional && explicit) form.append('size', explicit)
-    if (withOptional && profile.quality) form.append('quality', profile.quality)
-    if (withOptional && profile.outputFormat) form.append('output_format', profile.outputFormat)
-    if (withOptional && profile.inputFidelity) form.append('input_fidelity', profile.inputFidelity)
+    if (active.includes('size') && requested) form.append('size', requested)
+    if (active.includes('quality') && quality) form.append('quality', quality)
+    if (active.includes('output_format') && profile.outputFormat) form.append('output_format', profile.outputFormat)
+    if (active.includes('input_fidelity') && profile.inputFidelity) form.append('input_fidelity', profile.inputFidelity)
 
     const res = await fetch(url, {
       method: 'POST',
@@ -165,19 +260,27 @@ export async function editImage(opts: {
     if (!res.ok) await readErrorMessage(res)
     const json = (await res.json()) as { data?: RawImage[] }
     return extractBuffers(json, timeoutMs)
-  })
+  }, isUnsupportedParamError)
+
+  return {
+    buffers,
+    dropped,
+    requestedSize: requested,
+    clampedFrom: fit.clamped ? fit.from : undefined,
+    actualSize: sizeText(probeImageSize(buffers[0], guessMime(buffers[0])))
+  }
 }
 
 /** 设置页连通性测试:实际生成一张小图(会消耗少量额度) */
 export async function imagePing(profile: ImageProfile, timeoutMs = 120_000): Promise<void> {
-  const buffers = await generateImages({
+  const result = await generateImages({
     profile,
     prompt: 'a small red circle on white background',
     ratio: '1:1',
     n: 1,
     timeoutMs
   })
-  if (!buffers.length) throw new ApiError('接口未返回图片')
+  if (!result.buffers.length) throw new ApiError('接口未返回图片')
 }
 
-export { guessMime }
+export { describeDropped, guessMime }
